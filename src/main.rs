@@ -188,36 +188,43 @@ impl<'m> PackageRelease<'m> {
 
         let mut is_pre_release = false;
         let version = {
-            let mut potential_version = prev_version.version.clone();
-            if let Ok(bump_level) = version::BumpLevel::from_str(&args.level_or_version) {
-                // bump level
-                if bump_level.bump_version(&mut potential_version, args.metadata.as_ref())? {
-                    let version = potential_version;
-                    let version_string = version.to_string();
-                    is_pre_release = bump_level.is_pre_release();
-                    Some(Version {
-                        version,
-                        version_string,
-                    })
-                } else {
-                    None
-                }
+            if args.config.skip_prerelease_actions {
+                Some(Version {
+                    version: prev_version.version.clone(),
+                    version_string: prev_version.version_string.clone(),
+                })
             } else {
-                // given version
-                let new_version =
-                    semver::Version::parse(&args.level_or_version).map_err(FatalError::from)?;
-                if new_version > potential_version {
-                    is_pre_release = new_version.is_prerelease();
-                    Some(Version {
-                        version: new_version,
-                        version_string: args.level_or_version.to_owned(),
-                    })
-                } else if new_version == potential_version {
-                    None
+                let mut potential_version = prev_version.version.clone();
+                if let Ok(bump_level) = version::BumpLevel::from_str(&args.level_or_version) {
+                    // bump level
+                    if bump_level.bump_version(&mut potential_version, args.metadata.as_ref())? {
+                        let version = potential_version;
+                        let version_string = version.to_string();
+                        is_pre_release = bump_level.is_pre_release();
+                        Some(Version {
+                            version,
+                            version_string,
+                        })
+                    } else {
+                        None
+                    }
                 } else {
-                    return Err(error::FatalError::UnsupportedVersionReq(
-                        "Cannot release version smaller than current one".to_owned(),
-                    ));
+                    // given version
+                    let new_version =
+                        semver::Version::parse(&args.level_or_version).map_err(FatalError::from)?;
+                    if new_version > potential_version {
+                        is_pre_release = new_version.is_prerelease();
+                        Some(Version {
+                            version: new_version,
+                            version_string: args.level_or_version.to_owned(),
+                        })
+                    } else if new_version == potential_version {
+                        None
+                    } else {
+                        return Err(error::FatalError::UnsupportedVersionReq(
+                            "Cannot release version smaller than current one".to_owned(),
+                        ));
+                    }
                 }
             }
         };
@@ -231,9 +238,7 @@ impl<'m> PackageRelease<'m> {
 
         let base = version.as_ref().unwrap_or_else(|| &prev_version);
 
-        let tag = if config.disable_tag() {
-            None
-        } else {
+        let tag = {
             let mut template = Template {
                 prev_version: Some(&prev_version.version_string),
                 version: Some(&base.version_string),
@@ -247,21 +252,23 @@ impl<'m> PackageRelease<'m> {
             Some(template.render(config.tag_name()))
         };
 
-        let post_version = if !is_pre_release && !config.no_dev_version() {
-            let mut post = base.version.clone();
-            post.increment_patch();
-            post.pre.push(Identifier::AlphaNumeric(
-                config.dev_version_ext().to_owned(),
-            ));
-            let post_string = post.to_string();
+        let post_version =
+            if !is_pre_release && !config.no_dev_version() && !args.config.skip_postrelease_actions
+            {
+                let mut post = base.version.clone();
+                post.increment_patch();
+                post.pre.push(Identifier::AlphaNumeric(
+                    config.dev_version_ext().to_owned(),
+                ));
+                let post_string = post.to_string();
 
-            Some(Version {
-                version: post,
-                version_string: post_string,
-            })
-        } else {
-            None
-        };
+                Some(Version {
+                    version: post,
+                    version_string: post_string,
+                })
+            } else {
+                None
+            };
 
         let features = if config.enable_all_features() {
             Features::All
@@ -580,105 +587,114 @@ fn release_packages<'m>(
     }
 
     // STEP 2: update current version, save and commit
-    let mut shared_commit = false;
-    for pkg in pkgs {
-        let dry_run = args.dry_run;
-        let cwd = pkg.package_path;
-        let crate_name = pkg.meta.name.as_str();
+    let update_current_version_and_commit = || -> Result<Option<i32>, error::FatalError> {
+        let mut shared_commit = false;
+        for pkg in pkgs {
+            let dry_run = args.dry_run;
+            let cwd = pkg.package_path;
+            let crate_name = pkg.meta.name.as_str();
 
-        if let Some(version) = pkg.version.as_ref() {
-            let new_version_string = version.version_string.as_str();
-            log::info!("Update {} to version {}", crate_name, new_version_string);
-            if !dry_run {
-                cargo::set_package_version(&pkg.manifest_path, &new_version_string)?;
-            }
-            update_dependent_versions(pkg, version, dry_run)?;
-            if dry_run {
-                log::debug!("Updating lock file");
-            } else {
-                cargo::update_lock(&pkg.manifest_path)?;
-            }
-
-            if !pkg.config.pre_release_replacements().is_empty() {
-                // try replacing text in configured files
-                let template = Template {
-                    prev_version: Some(&pkg.prev_version.version_string),
-                    version: Some(&new_version_string),
-                    crate_name: Some(crate_name),
-                    date: Some(NOW.as_str()),
-                    tag_name: pkg.tag.as_ref().map(|s| s.as_str()),
-                    ..Default::default()
-                };
-                let prerelease = !version.version.pre.is_empty();
-                do_file_replacements(
-                    pkg.config.pre_release_replacements(),
-                    &template,
-                    cwd,
-                    prerelease,
-                    dry_run,
-                )?;
-            }
-
-            // pre-release hook
-            if let Some(pre_rel_hook) = pkg.config.pre_release_hook() {
-                let pre_rel_hook = pre_rel_hook.args();
-                log::debug!("Calling pre-release hook: {:?}", pre_rel_hook);
-                let envs = btreemap! {
-                    OsStr::new("PREV_VERSION") => pkg.prev_version.version_string.as_ref(),
-                    OsStr::new("NEW_VERSION") => new_version_string.as_ref(),
-                    OsStr::new("DRY_RUN") => OsStr::new(if dry_run { "true" } else { "false" }),
-                    OsStr::new("CRATE_NAME") => OsStr::new(crate_name),
-                    OsStr::new("WORKSPACE_ROOT") => ws_meta.workspace_root.as_os_str(),
-                    OsStr::new("CRATE_ROOT") => pkg.manifest_path.parent().unwrap_or_else(|| Path::new(".")).as_os_str(),
-                };
-                // we use dry_run environmental variable to run the script
-                // so here we set dry_run=false and always execute the command.
-                if !cmd::call_with_env(pre_rel_hook, envs, cwd, false)? {
-                    log::warn!(
-                        "Release of {} aborted by non-zero return of prerelease hook.",
-                        crate_name
-                    );
-                    return Ok(107);
+            if let Some(version) = pkg.version.as_ref() {
+                let new_version_string = version.version_string.as_str();
+                log::info!("Update {} to version {}", crate_name, new_version_string);
+                if !dry_run {
+                    cargo::set_package_version(&pkg.manifest_path, &new_version_string)?;
                 }
-            }
+                update_dependent_versions(pkg, version, dry_run)?;
+                if dry_run {
+                    log::debug!("Updating lock file");
+                } else {
+                    cargo::update_lock(&pkg.manifest_path)?;
+                }
 
-            if ws_config.consolidate_commits() {
-                shared_commit = true;
-            } else {
-                let template = Template {
-                    prev_version: Some(&pkg.prev_version.version_string),
-                    version: Some(&new_version_string),
-                    crate_name: Some(crate_name),
-                    date: Some(NOW.as_str()),
-                    ..Default::default()
-                };
-                let commit_msg = template.render(pkg.config.pre_release_commit_message());
-                let sign = pkg.config.sign_commit();
-                if !git::commit_all(cwd, &commit_msg, sign, dry_run)? {
-                    // commit failed, abort release
-                    return Ok(102);
+                if !pkg.config.pre_release_replacements().is_empty() {
+                    // try replacing text in configured files
+                    let template = Template {
+                        prev_version: Some(&pkg.prev_version.version_string),
+                        version: Some(&new_version_string),
+                        crate_name: Some(crate_name),
+                        date: Some(NOW.as_str()),
+                        tag_name: pkg.tag.as_ref().map(|s| s.as_str()),
+                        ..Default::default()
+                    };
+                    let prerelease = !version.version.pre.is_empty();
+                    do_file_replacements(
+                        pkg.config.pre_release_replacements(),
+                        &template,
+                        cwd,
+                        prerelease,
+                        dry_run,
+                    )?;
+                }
+
+                // pre-release hook
+                if let Some(pre_rel_hook) = pkg.config.pre_release_hook() {
+                    let pre_rel_hook = pre_rel_hook.args();
+                    log::debug!("Calling pre-release hook: {:?}", pre_rel_hook);
+                    let envs = btreemap! {
+                        OsStr::new("PREV_VERSION") => pkg.prev_version.version_string.as_ref(),
+                        OsStr::new("NEW_VERSION") => new_version_string.as_ref(),
+                        OsStr::new("DRY_RUN") => OsStr::new(if dry_run { "true" } else { "false" }),
+                        OsStr::new("CRATE_NAME") => OsStr::new(crate_name),
+                        OsStr::new("WORKSPACE_ROOT") => ws_meta.workspace_root.as_os_str(),
+                        OsStr::new("CRATE_ROOT") => pkg.manifest_path.parent().unwrap_or_else(|| Path::new(".")).as_os_str(),
+                    };
+                    // we use dry_run environmental variable to run the script
+                    // so here we set dry_run=false and always execute the command.
+                    if !cmd::call_with_env(pre_rel_hook, envs, cwd, false)? {
+                        log::warn!(
+                            "Release of {} aborted by non-zero return of prerelease hook.",
+                            crate_name
+                        );
+                        return Ok(Some(107));
+                    }
+                }
+
+                if ws_config.consolidate_commits() {
+                    shared_commit = true;
+                } else {
+                    let template = Template {
+                        prev_version: Some(&pkg.prev_version.version_string),
+                        version: Some(&new_version_string),
+                        crate_name: Some(crate_name),
+                        date: Some(NOW.as_str()),
+                        ..Default::default()
+                    };
+                    let commit_msg = template.render(pkg.config.pre_release_commit_message());
+                    let sign = pkg.config.sign_commit();
+                    if !git::commit_all(cwd, &commit_msg, sign, dry_run)? {
+                        // commit failed, abort release
+                        return Ok(Some(102));
+                    }
                 }
             }
         }
-    }
-    if shared_commit {
-        let shared_commit_msg = {
-            let template = Template {
-                date: Some(NOW.as_str()),
-                ..Default::default()
+        if shared_commit {
+            let shared_commit_msg = {
+                let template = Template {
+                    date: Some(NOW.as_str()),
+                    ..Default::default()
+                };
+                template.render(ws_config.pre_release_commit_message())
             };
-            template.render(ws_config.pre_release_commit_message())
-        };
-        if !git::commit_all(
-            &ws_meta.workspace_root,
-            &shared_commit_msg,
-            ws_config.sign_commit(),
-            dry_run,
-        )? {
-            // commit failed, abort release
-            return Ok(102);
+            if !git::commit_all(
+                &ws_meta.workspace_root,
+                &shared_commit_msg,
+                ws_config.sign_commit(),
+                dry_run,
+            )? {
+                // commit failed, abort release
+                return Ok(Some(102));
+            }
         }
-    }
+
+        Ok(None)
+    };
+    if !args.config.skip_prerelease_actions {
+        if let Some(code) = update_current_version_and_commit()? {
+            return Ok(code);
+        }
+    };
 
     // STEP 3: cargo publish
     for pkg in pkgs {
@@ -711,8 +727,12 @@ fn release_packages<'m>(
         }
     }
 
-    // STEP 5: Tag
+    // STEP 4: Tag
     for pkg in pkgs {
+        if pkg.config.disable_tag() {
+            continue;
+        };
+
         if let Some(tag_name) = pkg.tag.as_ref() {
             let sign = pkg.config.sign_commit() || pkg.config.sign_tag();
 
@@ -743,34 +763,40 @@ fn release_packages<'m>(
         }
     }
 
-    // STEP 6: bump version
-    let mut shared_commit = false;
-    for pkg in pkgs {
-        if let Some(version) = pkg.post_version.as_ref() {
-            let cwd = pkg.package_path;
+    // STEP 5: bump version
+    let postrelease_bump = || -> Result<Option<i32>, error::FatalError> {
+        let mut shared_commit = false;
+        for pkg in pkgs {
             let crate_name = pkg.meta.name.as_str();
+            let post_version = if let Some(post_version) = pkg.post_version.as_ref() {
+                let post_version_string = post_version.version_string.as_ref();
+                log::info!(
+                    "Starting {}'s next development iteration {}",
+                    crate_name,
+                    post_version_string,
+                );
+                update_dependent_versions(pkg, post_version, dry_run)?;
+                if !dry_run {
+                    cargo::set_package_version(&pkg.manifest_path, &post_version_string)?;
+                    cargo::update_lock(&pkg.manifest_path)?;
+                }
+                Some(post_version)
+            } else {
+                None
+            };
 
-            let updated_version_string = version.version_string.as_ref();
-            log::info!(
-                "Starting {}'s next development iteration {}",
-                crate_name,
-                updated_version_string,
-            );
-            update_dependent_versions(pkg, version, dry_run)?;
-            if !dry_run {
-                cargo::set_package_version(&pkg.manifest_path, &updated_version_string)?;
-                cargo::update_lock(&pkg.manifest_path)?;
-            }
-            let base = pkg.version.as_ref().unwrap_or_else(|| &pkg.prev_version);
             let template = Template {
                 prev_version: Some(&pkg.prev_version.version_string),
-                version: Some(&base.version_string),
+                version: pkg.post_version.as_ref().map(|v| v.version_string.as_str()),
                 crate_name: Some(crate_name),
                 date: Some(NOW.as_str()),
                 tag_name: pkg.tag.as_ref().map(|s| s.as_str()),
-                next_version: Some(updated_version_string),
+                next_version: post_version.map(|v| v.version_string.as_str()),
                 ..Default::default()
             };
+
+            let cwd = pkg.package_path;
+
             if !pkg.config.post_release_replacements().is_empty() {
                 // try replacing text in configured files
                 do_file_replacements(
@@ -781,6 +807,7 @@ fn release_packages<'m>(
                     dry_run,
                 )?;
             }
+
             let commit_msg = template.render(pkg.config.post_release_commit_message());
 
             if ws_config.consolidate_commits() {
@@ -788,31 +815,38 @@ fn release_packages<'m>(
             } else {
                 let sign = pkg.config.sign_commit();
                 if !git::commit_all(cwd, &commit_msg, sign, dry_run)? {
-                    return Ok(105);
+                    return Ok(Some(105));
                 }
             }
         }
-    }
-    if shared_commit {
-        let shared_commit_msg = {
-            let template = Template {
-                date: Some(NOW.as_str()),
-                ..Default::default()
+        if shared_commit {
+            let shared_commit_msg = {
+                let template = Template {
+                    date: Some(NOW.as_str()),
+                    ..Default::default()
+                };
+                template.render(ws_config.post_release_commit_message())
             };
-            template.render(ws_config.post_release_commit_message())
-        };
-        if !git::commit_all(
-            &ws_meta.workspace_root,
-            &shared_commit_msg,
-            ws_config.sign_commit(),
-            dry_run,
-        )? {
-            // commit failed, abort release
-            return Ok(102);
+            if !git::commit_all(
+                &ws_meta.workspace_root,
+                &shared_commit_msg,
+                ws_config.sign_commit(),
+                dry_run,
+            )? {
+                // commit failed, abort release
+                return Ok(Some(102));
+            }
+        }
+
+        Ok(None)
+    };
+    if !args.config.skip_postrelease_actions {
+        if let Some(code) = postrelease_bump()? {
+            return Ok(code);
         }
     }
 
-    // STEP 7: git push
+    // STEP 6: git push
     let mut pushed: HashSet<_> = HashSet::new();
     for pkg in pkgs {
         if !pkg.config.disable_push() {
@@ -949,6 +983,14 @@ struct ConfigArgs {
     skip_push: bool,
 
     #[structopt(long)]
+    /// Do perform the prerelease actions
+    skip_prerelease_actions: bool,
+
+    #[structopt(long)]
+    /// Do not perform postrelease actions
+    skip_postrelease_actions: bool,
+
+    #[structopt(long)]
     /// Do not create git tag
     skip_tag: bool,
 
@@ -1012,6 +1054,14 @@ impl config::ConfigSource for ConfigArgs {
 
     fn disable_push(&self) -> Option<bool> {
         self.skip_push.as_some(true)
+    }
+
+    fn disable_prerelease_actions(&self) -> Option<bool> {
+        self.skip_prerelease_actions.as_some(true)
+    }
+
+    fn disable_postrelease_actions(&self) -> Option<bool> {
+        self.skip_postrelease_actions.as_some(true)
     }
 
     fn dev_version_ext(&self) -> Option<&str> {
