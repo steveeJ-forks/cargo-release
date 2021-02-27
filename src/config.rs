@@ -36,6 +36,18 @@ pub trait ConfigSource {
         None
     }
 
+    fn disable_prerelease_actions(&self) -> Option<bool> {
+        None
+    }
+
+    fn disable_release_actions(&self) -> Option<bool> {
+        None
+    }
+
+    fn disable_postrelease_actions(&self) -> Option<bool> {
+        None
+    }
+
     fn dev_version_ext(&self) -> Option<&str> {
         None
     }
