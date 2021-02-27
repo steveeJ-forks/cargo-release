@@ -696,7 +696,38 @@ fn release_packages<'m>(
         }
     };
 
-    // STEP 3: Tag
+    // STEP 3: cargo publish
+    for pkg in pkgs {
+        if !pkg.config.disable_publish() {
+            let crate_name = pkg.meta.name.as_str();
+            let base = pkg.version.as_ref().unwrap_or_else(|| &pkg.prev_version);
+
+            log::info!("Running cargo publish on {}", crate_name);
+            // feature list to release
+            let features = &pkg.features;
+            if !cargo::publish(
+                dry_run,
+                &pkg.manifest_path,
+                features,
+                pkg.config.registry(),
+                args.config.token.as_ref().map(AsRef::as_ref),
+            )? {
+                return Ok(103);
+            }
+            let timeout = std::time::Duration::from_secs(300);
+
+            if pkg.config.registry().is_none() {
+                cargo::wait_for_publish(crate_name, &base.version_string, timeout, dry_run)?;
+                // HACK: Even once the index is updated, there seems to be another step before the publish is fully ready.
+                // We don't have a way yet to check for that, so waiting for now in hopes everything is ready
+                std::time::Duration::from_secs(5);
+            } else {
+                log::debug!("Not waiting for publish because the registry is not crates.io and doesn't get updated automatically");
+            }
+        }
+    }
+
+    // STEP 4: Tag
     for pkg in pkgs {
         if pkg.config.disable_tag() {
             continue;
@@ -732,54 +763,59 @@ fn release_packages<'m>(
         }
     }
 
-    // STEP 4: bump version
+    // STEP 5: bump version
     let postrelease_bump = || -> Result<Option<i32>, error::FatalError> {
         let mut shared_commit = false;
         for pkg in pkgs {
-            if let Some(version) = pkg.post_version.as_ref() {
-                let cwd = pkg.package_path;
-                let crate_name = pkg.meta.name.as_str();
-
-                let updated_version_string = version.version_string.as_ref();
+            let crate_name = pkg.meta.name.as_str();
+            let post_version = if let Some(post_version) = pkg.post_version.as_ref() {
+                let post_version_string = post_version.version_string.as_ref();
                 log::info!(
                     "Starting {}'s next development iteration {}",
                     crate_name,
-                    updated_version_string,
+                    post_version_string,
                 );
-                update_dependent_versions(pkg, version, dry_run)?;
+                update_dependent_versions(pkg, post_version, dry_run)?;
                 if !dry_run {
-                    cargo::set_package_version(&pkg.manifest_path, &updated_version_string)?;
+                    cargo::set_package_version(&pkg.manifest_path, &post_version_string)?;
                     cargo::update_lock(&pkg.manifest_path)?;
                 }
-                let base = pkg.version.as_ref().unwrap_or_else(|| &pkg.prev_version);
-                let template = Template {
-                    prev_version: Some(&pkg.prev_version.version_string),
-                    version: Some(&base.version_string),
-                    crate_name: Some(crate_name),
-                    date: Some(NOW.as_str()),
-                    tag_name: pkg.tag.as_ref().map(|s| s.as_str()),
-                    next_version: Some(updated_version_string),
-                    ..Default::default()
-                };
-                if !pkg.config.post_release_replacements().is_empty() {
-                    // try replacing text in configured files
-                    do_file_replacements(
-                        pkg.config.post_release_replacements(),
-                        &template,
-                        cwd,
-                        false, // post-release replacements should always be applied
-                        dry_run,
-                    )?;
-                }
-                let commit_msg = template.render(pkg.config.post_release_commit_message());
+                Some(post_version)
+            } else {
+                None
+            };
 
-                if ws_config.consolidate_commits() {
-                    shared_commit = true;
-                } else {
-                    let sign = pkg.config.sign_commit();
-                    if !git::commit_all(cwd, &commit_msg, sign, dry_run)? {
-                        return Ok(Some(105));
-                    }
+            let template = Template {
+                prev_version: Some(&pkg.prev_version.version_string),
+                version: pkg.post_version.as_ref().map(|v| v.version_string.as_str()),
+                crate_name: Some(crate_name),
+                date: Some(NOW.as_str()),
+                tag_name: pkg.tag.as_ref().map(|s| s.as_str()),
+                next_version: post_version.map(|v| v.version_string.as_str()),
+                ..Default::default()
+            };
+
+            let cwd = pkg.package_path;
+
+            if !pkg.config.post_release_replacements().is_empty() {
+                // try replacing text in configured files
+                do_file_replacements(
+                    pkg.config.post_release_replacements(),
+                    &template,
+                    cwd,
+                    false, // post-release replacements should always be applied
+                    dry_run,
+                )?;
+            }
+
+            let commit_msg = template.render(pkg.config.post_release_commit_message());
+
+            if ws_config.consolidate_commits() {
+                shared_commit = true;
+            } else {
+                let sign = pkg.config.sign_commit();
+                if !git::commit_all(cwd, &commit_msg, sign, dry_run)? {
+                    return Ok(Some(105));
                 }
             }
         }
@@ -810,7 +846,7 @@ fn release_packages<'m>(
         }
     }
 
-    // STEP 5: git push
+    // STEP 6: git push
     let mut pushed: HashSet<_> = HashSet::new();
     for pkg in pkgs {
         if !pkg.config.disable_push() {
@@ -827,37 +863,6 @@ fn release_packages<'m>(
                 if !git::push_tag(&ws_meta.workspace_root, git_remote, &tag_name, dry_run)? {
                     return Ok(106);
                 }
-            }
-        }
-    }
-
-    // STEP 6: cargo publish
-    for pkg in pkgs {
-        if !pkg.config.disable_publish() {
-            let crate_name = pkg.meta.name.as_str();
-            let base = pkg.version.as_ref().unwrap_or_else(|| &pkg.prev_version);
-
-            log::info!("Running cargo publish on {}", crate_name);
-            // feature list to release
-            let features = &pkg.features;
-            if !cargo::publish(
-                dry_run,
-                &pkg.manifest_path,
-                features,
-                pkg.config.registry(),
-                args.config.token.as_ref().map(AsRef::as_ref),
-            )? {
-                return Ok(103);
-            }
-            let timeout = std::time::Duration::from_secs(300);
-
-            if pkg.config.registry().is_none() {
-                cargo::wait_for_publish(crate_name, &base.version_string, timeout, dry_run)?;
-                // HACK: Even once the index is updated, there seems to be another step before the publish is fully ready.
-                // We don't have a way yet to check for that, so waiting for now in hopes everything is ready
-                std::time::Duration::from_secs(5);
-            } else {
-                log::debug!("Not waiting for publish because the registry is not crates.io and doesn't get updated automatically");
             }
         }
     }
