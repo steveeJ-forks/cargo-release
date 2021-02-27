@@ -238,9 +238,7 @@ impl<'m> PackageRelease<'m> {
 
         let base = version.as_ref().unwrap_or_else(|| &prev_version);
 
-        let tag = if config.disable_tag() {
-            None
-        } else {
+        let tag = {
             let mut template = Template {
                 prev_version: Some(&prev_version.version_string),
                 version: Some(&base.version_string),
@@ -700,6 +698,10 @@ fn release_packages<'m>(
 
     // STEP 3: Tag
     for pkg in pkgs {
+        if pkg.config.disable_tag() {
+            continue;
+        };
+
         if let Some(tag_name) = pkg.tag.as_ref() {
             let sign = pkg.config.sign_commit() || pkg.config.sign_tag();
 
